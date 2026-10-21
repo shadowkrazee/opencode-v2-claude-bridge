@@ -876,6 +876,44 @@ test("a rate limit after a rejected usage window reaches OpenCode as quota, with
   )
 })
 
+test("a quota error with no rate-limit event of its own is explained from the latest one whose window has not reset", async () => {
+  const OUT_OF_EXTRA = "API Error: 400 You're out of extra usage. Ask your workspace admin to add more so you can keep going."
+  const errorOf = (result: Awaited<ReturnType<typeof post>>) => (result.events.at(-1) as { error: { message: string; code: number } }).error
+  const run = (resetsAt: number) => {
+    let calls = 0
+    return async function* () {
+      const call = calls++
+      if (call === 0) {
+        // An agent turn: Claude Code reports the usage window with each request it makes.
+        yield rateLimitEvent({ status: "allowed", rateLimitType: "five_hour", resetsAt, overageStatus: "rejected", overageDisabledReason: "org_level_disabled" })
+        yield messageStart()
+        yield* textBlock(0, "ok")
+        yield messageStop()
+        yield success()
+      } else if (call === 1) {
+        // A request the API refuses outright reports no event.
+        yield* apiError(OUT_OF_EXTRA, "unknown", 400)
+      } else {
+        yield* apiError("API Error: 400 invalid_request_error", "invalid_request", 400)
+      }
+    }
+  }
+  const hint = "Claude Code last reported the five-hour window as available. Extra usage is not available (org_level_disabled)."
+
+  await withBridge(run(Math.floor(Date.now() / 1000) + 3600), async ({ port }) => {
+    await post(port, { model, stream: true, messages: [ASK] })
+    const quota = errorOf(await post(port, { model, stream: true, messages: [ASK] }))
+    assert.equal(quota.code, 402)
+    assert.equal(quota.message, `${OUT_OF_EXTRA}\n\n${hint}`)
+    assert.equal(errorOf(await post(port, { model, stream: true, messages: [ASK] })).message, "API Error: 400 invalid_request_error", "only quota errors borrow the event")
+  })
+
+  await withBridge(run(Math.floor(Date.now() / 1000) - 60), async ({ port }) => {
+    await post(port, { model, stream: true, messages: [ASK] })
+    assert.equal(errorOf(await post(port, { model, stream: true, messages: [ASK] })).message, OUT_OF_EXTRA, "an event whose window has reset is not used")
+  })
+})
+
 test("after a stalled stream, Claude Code's non-streaming retry delivers its text, tool calls and usage", async () => {
   await withBridge(
     async function* ({ client }) {

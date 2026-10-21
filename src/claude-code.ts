@@ -21,7 +21,7 @@ export const SETTING_SOURCES: NonNullable<Options["settingSources"]> = ["user"]
 export const CHILD_SETTINGS = { includeGitInstructions: false } satisfies Options["settings"]
 
 /** This plugin and its version, as Claude Code reports it. A test keeps it in step with package.json. */
-export const CLIENT_APP = "opencode-v2-claude-bridge/0.3.0"
+export const CLIENT_APP = "opencode-v2-claude-bridge/0.3.1"
 
 /**
  * Variables set for every Claude Code child on top of the inherited environment.

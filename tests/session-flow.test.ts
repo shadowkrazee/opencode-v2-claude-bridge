@@ -136,6 +136,35 @@ test("a title request keeps OpenCode's task prompt and reads no instruction file
   )
 })
 
+test("a compaction request runs on Claude Code's prompt alone, with no tools", async () => {
+  let reads = 0
+  await withBridge(
+    replying,
+    async ({ port, runs, prompts }) => {
+      // OpenCode resends the agent loop's prompt and tools, and asks for the summary in a last user message.
+      const compaction: ChatMessage[] = [
+        SYSTEM,
+        { role: "user", content: "Read a.ts" },
+        { role: "assistant", content: "Done." },
+        { role: "user", content: "You MUST summarize the conversation above." },
+      ]
+      await post(port, { model, stream: true, messages: compaction, tools: [READ_TOOL] }, { [SESSION_HEADER]: "ses_1", [KIND_HEADER]: "compaction" })
+      assert.deepEqual(runs[0]?.system, { type: "claude-code", append: undefined }, "OpenCode's agent prompt is not forwarded")
+      assert.equal(reads, 0, "the summary leaves instruction files out")
+      assert.equal(runs[0]?.toolServer, undefined)
+      assert.deepEqual(runs[0]?.allowedTools, [])
+      assert.doesNotMatch(prompts[0] ?? "", /build agent/)
+      assert.match(prompts[0] ?? "", /Read a\.ts[\s\S]*You MUST summarize the conversation above\./)
+    },
+    {
+      instructions: async () => {
+        reads++
+        return { text: "x", files: [], truncated: [], unreadable: [] }
+      },
+    },
+  )
+})
+
 test("a turn that used tools is resumable once it finishes", async () => {
   await withBridge(
     async function* ({ client, prompt }) {
@@ -182,6 +211,53 @@ test("title and compaction requests never create or resume sessions", async () =
     )
     assert.equal(await store.get("ses_1"), undefined)
   })
+})
+
+test("a compaction request containing a live tool result starts a throwaway replay", async () => {
+  await withBridge(
+    async function* ({ client, input }) {
+      if (!input.persistSession) {
+        yield messageStart()
+        yield* textBlock(0, "summary")
+        yield messageStop()
+        yield success()
+        return
+      }
+      yield messageStart()
+      yield* toolUseBlock(0, "toolu_1", "mcp__opencode__read", { path: "a.ts" })
+      yield messageStop()
+      await client!.callTool({ name: "read", arguments: { path: "a.ts" } })
+      yield messageStart()
+      yield* textBlock(0, "primary turn continued")
+      yield messageStop()
+      yield success()
+    },
+    async ({ port, runs, prompts }) => {
+      const ask: ChatMessage[] = [SYSTEM, { role: "user", content: "Read a.ts" }]
+      const first = await post(port, { model, stream: true, messages: ask, tools: [READ_TOOL] }, primary())
+      // OpenCode compacts with the agent loop's own request plus a last user message asking for the summary.
+      const compacted: ChatMessage[] = [
+        ...ask,
+        assistantToolCalls(first),
+        toolMessage("toolu_1", "export const a = 1"),
+        { role: "user", content: "Summarize the conversation." },
+      ]
+
+      const result = await post(
+        port,
+        { model, stream: true, messages: compacted },
+        { [SESSION_HEADER]: "ses_1", [KIND_HEADER]: "compaction" },
+      )
+
+      assert.equal(textOf(result), "summary")
+      assert.equal(runs.length, 2, "compaction starts a new query instead of resuming the live primary turn")
+      assert.equal(runs[1]?.persistSession, false)
+      assert.equal(runs[1]?.resume, undefined)
+      assert.equal(runs[1]?.sessionId, undefined)
+      assert.deepEqual(runs[1]?.system, { type: "claude-code", append: undefined })
+      assert.match(prompts[1] ?? "", /Read a\.ts[\s\S]*export const a = 1/, "the throwaway query replays the transcript")
+    },
+  )
 })
 
 test("a reverted or forked history replays into a fresh session", async () => {

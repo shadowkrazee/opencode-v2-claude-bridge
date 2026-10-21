@@ -21,15 +21,32 @@ const WINDOWS: Record<string, string> = {
 export const formatResetTime = (seconds: number) =>
   new Date(seconds * 1000).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })
 
+const windowName = (info: SDKRateLimitInfo) => (info.rateLimitType ? (WINDOWS[info.rateLimitType] ?? info.rateLimitType) : undefined)
+
+/** What Claude Code reported about extra usage, when it is not available. */
+const describeOverage = (info: SDKRateLimitInfo): string | undefined =>
+  info.overageStatus === "rejected" || info.overageDisabledReason
+    ? `Extra usage is not available${info.overageDisabledReason ? ` (${info.overageDisabledReason})` : ""}.`
+    : undefined
+
 /** What Claude Code reported about the spent usage window, in plain words. */
 const describeRejection = (info: SDKRateLimitInfo): string => {
-  const window = info.rateLimitType ? (WINDOWS[info.rateLimitType] ?? info.rateLimitType) : undefined
+  const window = windowName(info)
   const resets = info.resetsAt ? `; it resets ${formatResetTime(info.resetsAt)}` : ""
-  const parts = [`Claude usage limit reached${window ? ` (${window} window)` : ""}${resets}.`]
-  if (info.overageStatus === "rejected" || info.overageDisabledReason) {
-    parts.push(`Extra usage is not available${info.overageDisabledReason ? ` (${info.overageDisabledReason})` : ""}.`)
-  }
-  return parts.join(" ")
+  const overage = describeOverage(info)
+  return [`Claude usage limit reached${window ? ` (${window} window)` : ""}${resets}.`, ...(overage ? [overage] : [])].join(" ")
+}
+
+/**
+ * A quota error while Claude Code still reported the usage window as
+ * available and extra usage as not: restating both shows the window did not
+ * run out, without guessing why the request was refused.
+ */
+const describeAvailable = (info: SDKRateLimitInfo): string | undefined => {
+  const overage = describeOverage(info)
+  if (!overage) return undefined
+  const window = windowName(info)
+  return `Claude Code last reported ${window ? `the ${window} window` : "your usage"} as available. ${overage}`
 }
 
 const AUTH_ERROR =/not logged in|please run \/login|invalid api key|authentication|unauthori[sz]ed|oauth token/i
@@ -55,6 +72,10 @@ export const explainAgentError = (
 ): string => {
   const hints: string[] = []
   if (rateLimit?.status === "rejected") hints.push(describeRejection(rateLimit))
+  else if (rateLimit && error?.status === 402) {
+    const available = describeAvailable(rateLimit)
+    if (available) hints.push(available)
+  }
   const gateway = gatewayVariablesSet(env)
   // Failures inside the bridge or Claude Code carry no API status; only their wording says what went wrong.
   const unclassified = !error || error.type === "bridge_error"

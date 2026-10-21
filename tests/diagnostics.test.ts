@@ -58,3 +58,16 @@ test("a spent usage window is described from Claude Code's own rate-limit event"
   assert.match(text, /Extra usage is not available \(org_level_disabled\)\./)
   assert.doesNotMatch(explainAgentError("API Error: 429", undefined, {}, { status: "allowed_warning", utilization: 0.9 }), /usage limit/)
 })
+
+test("a quota error with the usage window still available restates Claude Code's rate-limit event", () => {
+  const quota = { status: 402, type: "billing_error" }
+  const event = { status: "allowed", rateLimitType: "five_hour", overageStatus: "rejected", overageDisabledReason: "org_level_disabled" } as const
+  const message = "API Error: 400 You're out of extra usage. Add more at claude.ai/admin-settings/usage and keep going."
+  const text = explainAgentError(message, quota, {}, event)
+  assert.ok(text.startsWith(`${message}\n\n`), "the original text comes first")
+  assert.ok(text.endsWith("Claude Code last reported the five-hour window as available. Extra usage is not available (org_level_disabled)."))
+  assert.doesNotMatch(text, /usage limit reached/)
+  assert.match(explainAgentError(message, quota, {}, { status: "allowed", overageStatus: "rejected" }), /reported your usage as available\. Extra usage is not available\.$/)
+  assert.equal(explainAgentError(message, quota, {}, { status: "allowed" }), message, "nothing to restate while extra usage is available")
+  assert.equal(explainAgentError("API Error: 500", { status: 500, type: "api_error" }, {}, event), "API Error: 500", "only quota errors get the hint")
+})

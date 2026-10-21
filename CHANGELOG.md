@@ -4,6 +4,14 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-21
+
+### Fixed
+
+- Compaction no longer fails with `400 You're out of extra usage` on a subscription. OpenCode sends compaction its agent prompt, which the bridge still forwarded; compaction now runs on Claude Code's own prompt, as agent turns do, with OpenCode's summary instructions in the transcript. It also gets no tools, since OpenCode tells Claude not to call any.
+- A compaction request that carries a waiting turn's tool results no longer continues that turn and returns its output as the summary. Only agent turns continue a live turn; compaction and title requests replay the transcript into their own query, and the waiting turn is ended.
+- A quota error while Claude Code still reported the usage window as available now says so, with the reason extra usage is not available, so it no longer reads as a spent plan. A request the API refuses outright reports no usage window of its own, so the latest one from any turn is used until that window resets.
+
 ## [0.3.0] - 2026-10-16
 
 ### Breaking

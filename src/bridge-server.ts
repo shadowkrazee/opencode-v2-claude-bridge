@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { join } from "node:path"
-import { type EffortLevel, type Options, query } from "@anthropic-ai/claude-agent-sdk"
+import { type EffortLevel, type Options, query, type SDKRateLimitInfo } from "@anthropic-ai/claude-agent-sdk"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import type { Instructions } from "./instructions.js"
 import { CHILD_SETTINGS, childEnv, SETTING_SOURCES } from "./claude-code.js"
@@ -67,6 +67,9 @@ export const TOKEN_HEADER = "x-claude-bridge-token"
 
 /** Which OpenCode session a request serves, from the headers the plugin's `model.request` hook adds. */
 type RequestSession = { openCodeSessionId: string | undefined; kind: string | undefined }
+
+/** Only the agent loop may continue a live turn; one-off tasks always replay in a throwaway query. */
+const isAgentTurn = (session: RequestSession) => session.kind === undefined || session.kind === "primary"
 
 const header = (request: IncomingMessage, name: string): string | undefined => {
   const value = request.headers[name]
@@ -286,6 +289,11 @@ export const startBridgeServer = async (options: BridgeServerOptions): Promise<R
   const turnContext = new Map<Turn, { openCodeSessionId: string | undefined; conversation: ChatMessage[] }>()
   /** In-flight session-state writes, so the next turn of a session reads what the last one recorded. */
   const sessionWrites = new Map<string, Promise<void>>()
+  /** The latest rate-limit event from any turn, for explaining a quota error that came with none. */
+  let latestRateLimit: SDKRateLimitInfo | undefined
+  /** Only until its window resets: after that it no longer describes the account. */
+  const recentRateLimit = () =>
+    latestRateLimit?.resetsAt !== undefined && latestRateLimit.resetsAt * 1000 > Date.now() ? latestRateLimit : undefined
 
   /** The user's instruction files, or none when they cannot be read: a turn never fails over them. */
   const readInstructions = async (): Promise<Instructions | undefined> => {
@@ -329,8 +337,11 @@ export const startBridgeServer = async (options: BridgeServerOptions): Promise<R
   }
 
   const startTurn = async (body: ChatCompletionRequest, session: RequestSession, closed: () => boolean): Promise<Turn | undefined> => {
+    // OpenCode sends compaction the agent loop's tools but tells Claude not to call them; a tool call
+    // would end the summary, so Claude answers in text only.
+    const compaction = session.kind === "compaction"
     const { tools, withheld } =
-      body.tool_choice === "none" ? { tools: [], withheld: [] } : convertTools(body.tools, toolPolicy)
+      body.tool_choice === "none" || compaction ? { tools: [], withheld: [] } : convertTools(body.tools, toolPolicy)
     // A new message whose history contains a live turn's tool calls means
     // OpenCode moved on (for example, the user interrupted a running tool).
     for (const message of body.messages) {
@@ -342,11 +353,13 @@ export const startBridgeServer = async (options: BridgeServerOptions): Promise<R
 
     const { system, conversation } = splitSystem(body.messages)
     // Agent turns run on Claude Code's own prompt plus the user's instruction files; OpenCode's agent
-    // prompt is not forwarded. A one-off task (title, compaction) keeps OpenCode's prompt: it is the task.
-    const agentTurn = session.kind === undefined || session.kind === "primary"
+    // prompt is not forwarded. Compaction resends that agent prompt and asks for the summary in its
+    // last user message, so it runs on Claude Code's prompt too, without the instruction files the
+    // summary leaves out. Other one-off tasks (title, generate) keep OpenCode's prompt: it is the task.
+    const agentTurn = isAgentTurn(session)
     const instructions = agentTurn ? await readInstructions() : undefined
     const systemPrompt: SystemPrompt =
-      agentTurn || !system ? { type: "claude-code", append: instructions?.text } : { type: "task", text: system }
+      agentTurn || compaction || !system ? { type: "claude-code", append: instructions?.text } : { type: "task", text: system }
     // Only the agent loop's own requests continue a session; titles and compaction are throwaway queries.
     const persist = session.openCodeSessionId !== undefined && session.kind === "primary"
     if (persist) await sessionWrites.get(session.openCodeSessionId!)
@@ -397,7 +410,9 @@ export const startBridgeServer = async (options: BridgeServerOptions): Promise<R
         log("turn.end", { kind: session.kind ?? null, reason, completed: owner.completed, stream: owner.streamStats })
       },
       onFallback: (reason) => log("session.fallback", { reason }),
-      onRateLimit: (info) =>
+      recentRateLimit,
+      onRateLimit: (info) => {
+        latestRateLimit = info
         log("rate_limit", {
           status: info.status,
           window: info.rateLimitType ?? null,
@@ -406,7 +421,8 @@ export const startBridgeServer = async (options: BridgeServerOptions): Promise<R
           overageStatus: info.overageStatus ?? null,
           overageDisabledReason: info.overageDisabledReason ?? null,
           usingOverage: info.isUsingOverage ?? null,
-        }),
+        })
+      },
     })
     turns.add(turn)
     // Only the agent loop's turns own session state. A title request shares the session ID, and
@@ -491,7 +507,10 @@ export const startBridgeServer = async (options: BridgeServerOptions): Promise<R
       log("request.closed", { kind: session.kind ?? null, stage: "before results" })
       return
     }
-    const resumed = results.size > 0 ? resumeTurn(results, followUps, body.messages) : undefined
+    // A compaction or title prompt may include a live turn's tool results as transcript
+    // content. It must replay those into its own throwaway query, never deliver them to
+    // the waiting primary turn.
+    const resumed = isAgentTurn(session) && results.size > 0 ? resumeTurn(results, followUps, body.messages) : undefined
     const context = resumed && turnContext.get(resumed)
     if (context) context.conversation = splitSystem(body.messages).conversation
     const turn = resumed ?? (await startTurn(body, session, closed))
